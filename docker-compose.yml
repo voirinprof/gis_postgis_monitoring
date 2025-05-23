@@ -1,0 +1,136 @@
+version: "3.9"
+services:
+  # PostGIS/pgRouting container
+  db:
+    image: pgrouting/pgrouting:latest  # Specific lightweight PostGIS image with pgRouting
+    container_name: postgis
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./postgis/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgis/postgresql.conf:/etc/postgresql/postgresql.conf  # Custom config
+    # ports:
+    #   - "5432:5432"
+    networks:
+      - monitoring_network
+    command: -c config_file=/etc/postgresql/postgresql.conf  # Load custom config
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_QC_USER:-qc_user}", "-d", "${POSTGRES_QC_DB:-qc_routing}"]
+      interval: 10s  # Faster health checks
+      timeout: 5s
+      retries: 10
+    
+  # PgBouncer container for connection pooling
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.0-p1   # Specific version for stability
+    container_name: pgbouncer
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./postgis/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini
+      - ./postgis/userlist.txt:/etc/pgbouncer/userlist.txt
+    networks:
+      - monitoring_network
+    ports:
+      - "5432:5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-h', 'localhost']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  flask-app:
+    build:
+      context: ./flask
+      dockerfile: Dockerfile
+    container_name: flask_api
+    volumes:
+      - ./flask:/app
+      - ./logs:/app/logs
+    networks:
+      - monitoring_network
+    ports:
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_QC_USER:-qc_user}:${POSTGRES_QC_PASSWORD:-qc_password}@pgbouncer/${POSTGRES_QC_DB:-qc_routing}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Creator container for network creation
+  creator:
+    build:
+      context: ./creator
+      dockerfile: Dockerfile
+    container_name: creator
+    env_file:
+      - .env
+    volumes:
+      - ./creator:/app
+      - ./data:/data
+    networks:
+      - monitoring_network
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_QC_USER:-qc_user}:${POSTGRES_QC_PASSWORD:-qc_password}@pgbouncer/${POSTGRES_QC_DB:-qc_routing}
+    command: ["python", "create_network.py"]
+    
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_QC_USER:-qc_user}:${POSTGRES_QC_PASSWORD:-qc_password}@pgbouncer/${POSTGRES_QC_DB:-qc_routing}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      - pgbouncer
+    networks:
+      - monitoring_network
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - postgres-exporter
+    networks:
+      - monitoring_network
+
+  grafana:
+    image: grafana/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring_network
+
+volumes:
+  postgis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitoring_network:
+    driver: bridge
